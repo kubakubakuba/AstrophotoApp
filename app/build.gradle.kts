@@ -54,6 +54,7 @@ dependencies {
     implementation(libs.kotlinx.datetime)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.coil.compose)
+    implementation(libs.osmdroid)
     
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 

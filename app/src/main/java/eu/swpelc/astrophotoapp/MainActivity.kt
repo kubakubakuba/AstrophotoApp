@@ -6,8 +6,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.app.Application
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -47,6 +51,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.android.gms.location.LocationServices
@@ -66,12 +71,20 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
+import org.json.JSONObject
 import kotlinx.datetime.*
 import kotlin.time.Instant
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.*
 import kotlin.time.Duration.Companion.days
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.ColorFilter
+
+
+// --- Night mode composition local ---
+val LocalNightMode = compositionLocalOf { false }
 
 // --- Data Models ---
 data class AppLocation(val lat: Double, val lon: Double, val name: String)
@@ -108,8 +121,19 @@ data class AstroState(
     val nightLength: String = "--"
 )
 
+data class CalendarDayData(
+    val sunrise:          String = "--:--",
+    val sunset:           String = "--:--",
+    val civilDawn:        String = "--:--",
+    val civilDusk:        String = "--:--",
+    val moonrise:         String = "--:--",
+    val moonset:          String = "--:--",
+    val moonIllumination: Int    = 0
+)
 // --- ViewModel ---
-class AstroViewModel : ViewModel() {
+class AstroViewModel(application: Application) : AndroidViewModel(application) {
+    private val prefs = application.getSharedPreferences("astro_prefs", Context.MODE_PRIVATE)
+
     private val _location = MutableStateFlow<AppLocation?>(AppLocation(50.0755, 14.4378, "Prague, CZ"))
     val location = _location.asStateFlow()
 
@@ -119,16 +143,35 @@ class AstroViewModel : ViewModel() {
     private val _sunspots = MutableStateFlow<List<SunspotRegion>>(emptyList())
     val sunspots = _sunspots.asStateFlow()
 
+    private val _nightMode = MutableStateFlow(prefs.getBoolean("night_mode", false))
+    val nightMode = _nightMode.asStateFlow()
+
+    private val _kpIndex = MutableStateFlow<Float?>(null)
+    val kpIndex = _kpIndex.asStateFlow()
+
+    private val _calendarYear    = MutableStateFlow(Calendar.getInstance().get(Calendar.YEAR))
+    private val _calendarMonth   = MutableStateFlow(Calendar.getInstance().get(Calendar.MONTH) + 1)
+    val calendarYear  = _calendarYear.asStateFlow()
+    val calendarMonth = _calendarMonth.asStateFlow()
+    private val _calendarData    = MutableStateFlow<Map<Int, CalendarDayData>>(emptyMap())
+    val calendarData  = _calendarData.asStateFlow()
+    private val _calendarLoading = MutableStateFlow(false)
+    val calendarLoading = _calendarLoading.asStateFlow()
+    private var calendarJob: Job? = null
+
     private var astroJob: Job? = null
 
     init {
         calculateAstroData()
         fetchSunspots()
+        computeCalendar()
+        fetchKpIndex()
     }
 
     fun updateLocation(lat: Double, lon: Double, name: String) {
         _location.value = AppLocation(lat, lon, name)
         calculateAstroData()
+        computeCalendar()
     }
 
     fun calculateAstroData(date: LocalDate = Calendar.getInstance().let { cal ->
@@ -261,6 +304,84 @@ class AstroViewModel : ViewModel() {
         }
     }
 
+    fun computeCalendar(year: Int = _calendarYear.value, month: Int = _calendarMonth.value) {
+        val loc = _location.value ?: return
+        calendarJob?.cancel()
+        _calendarLoading.value = true
+        calendarJob = viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val formatter = SimpleDateFormat("HH:mm", Locale.getDefault())
+                val result = mutableMapOf<Int, CalendarDayData>()
+                val tempCal = Calendar.getInstance().apply { set(year, month - 1, 1) }
+                val daysInMonth = tempCal.getActualMaximum(Calendar.DAY_OF_MONTH)
+                for (day in 1..daysInMonth) {
+                    ensureActive()
+                    val startOfDayMs = Calendar.getInstance().apply {
+                        set(year, month - 1, day, 0, 0, 0); set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                    val startOfDay = Instant.fromEpochMilliseconds(startOfDayMs)
+                    val solarEvents = SolarEventSequence(
+                        start = startOfDay, latitude = loc.lat, longitude = loc.lon,
+                        requestedSolarEvents = SolarEventType.all, limit = 1.days
+                    ).toList()
+                    val lunarEvents = LunarEventSequence(
+                        start = startOfDay, latitude = loc.lat, longitude = loc.lon, limit = 1.days
+                    ).toList()
+                    fun fmt(t: kotlin.time.Instant?) = t?.let { formatter.format(Date(it.toEpochMilliseconds())) } ?: "--:--"
+                    val middayMs = startOfDayMs + 43_200_000L
+                    result[day] = CalendarDayData(
+                        sunrise          = fmt(solarEvents.filterIsInstance<SolarEvent.Sunrise>().firstOrNull()?.time),
+                        sunset           = fmt(solarEvents.filterIsInstance<SolarEvent.Sunset>().firstOrNull()?.time),
+                        civilDawn        = fmt(solarEvents.filterIsInstance<SolarEvent.CivilDawn>().firstOrNull()?.time),
+                        civilDusk        = fmt(solarEvents.filterIsInstance<SolarEvent.CivilDusk>().firstOrNull()?.time),
+                        moonrise         = fmt(lunarEvents.filterIsInstance<LunarEvent.HorizonEvent.Moonrise>().firstOrNull()?.time),
+                        moonset          = fmt(lunarEvents.filterIsInstance<LunarEvent.HorizonEvent.Moonset>().firstOrNull()?.time),
+                        moonIllumination = moonIlluminationPct(middayMs)
+                    )
+                }
+                ensureActive()
+                _calendarData.value = result
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+            } finally {
+                _calendarLoading.value = false
+            }
+        }
+    }
+
+    fun calendarPrevMonth() {
+        val y = _calendarYear.value; val m = _calendarMonth.value
+        if (m == 1) { _calendarYear.value = y - 1; _calendarMonth.value = 12 } else _calendarMonth.value = m - 1
+        _calendarData.value = emptyMap()
+        computeCalendar(_calendarYear.value, _calendarMonth.value)
+    }
+
+    fun calendarNextMonth() {
+        val y = _calendarYear.value; val m = _calendarMonth.value
+        if (m == 12) { _calendarYear.value = y + 1; _calendarMonth.value = 1 } else _calendarMonth.value = m + 1
+        _calendarData.value = emptyMap()
+        computeCalendar(_calendarYear.value, _calendarMonth.value)
+    }
+
+    fun fetchKpIndex() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val json = JSONArray(java.net.URL(
+                    "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+                ).readText())
+                // Index 0 is the header row; last entry is most recent data
+                val lastEntry = json.getJSONArray(json.length() - 1)
+                _kpIndex.value = lastEntry.getString(1).toFloatOrNull()
+            } catch (_: Exception) { }
+        }
+    }
+
+    fun toggleNightMode() {
+        val new = !_nightMode.value
+        _nightMode.value = new
+        prefs.edit().putBoolean("night_mode", new).apply()
+    }
+
     fun fetchSunspots() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -280,14 +401,51 @@ class AstroViewModel : ViewModel() {
 
 }
 
+// --- Night vision color scheme (red-on-black) ---
+private val nightColorScheme = darkColorScheme(
+    primary              = Color(0xFFCC2200),
+    onPrimary            = Color.Black,
+    primaryContainer     = Color(0xFF3A0000),
+    onPrimaryContainer   = Color(0xFFFF9988),
+    secondary            = Color(0xFF991100),
+    onSecondary          = Color.Black,
+    secondaryContainer   = Color(0xFF280000),
+    onSecondaryContainer = Color(0xFFFF6655),
+    background           = Color(0xFF000000),
+    onBackground         = Color(0xFFCC2200),
+    surface              = Color(0xFF0A0000),
+    onSurface            = Color(0xFFCC2200),
+    surfaceVariant       = Color(0xFF180000),
+    onSurfaceVariant     = Color(0xFFAA1100),
+    outline              = Color(0xFF550000),
+    outlineVariant       = Color(0xFF2A0000),
+    error                = Color(0xFFFF6666),
+    onError              = Color.Black,
+)
+
 // --- Main Activity ---
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
         setContent {
-            AstrophotoAppTheme(darkTheme = true) {
-                MainScreen()
+            val vm: AstroViewModel = viewModel()
+            val nightMode by vm.nightMode.collectAsState()
+            CompositionLocalProvider(LocalNightMode provides nightMode) {
+                if (nightMode) {
+                    MaterialTheme(colorScheme = nightColorScheme) {
+                        MainScreen(viewModel = vm)
+                    }
+                } else {
+                    AstrophotoAppTheme(darkTheme = true) {
+                        MainScreen(viewModel = vm)
+                    }
+                }
             }
         }
     }
@@ -304,6 +462,7 @@ fun MainScreen(viewModel: AstroViewModel = viewModel()) {
     val locationState by viewModel.location.collectAsState()
     val astroState by viewModel.astroState.collectAsState()
     val sunspots by viewModel.sunspots.collectAsState()
+    val nightMode by viewModel.nightMode.collectAsState()
     val timeFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
     var currentTimeStr by remember { mutableStateOf(timeFormat.format(Date())) }
     LaunchedEffect(Unit) {
@@ -375,11 +534,17 @@ fun MainScreen(viewModel: AstroViewModel = viewModel()) {
     Scaffold(
         topBar = {
             Column {
-                CenterAlignedTopAppBar(
+                TopAppBar(
                     title = {
                         Text(currentTimeStr, style = MaterialTheme.typography.titleMedium)
                     },
                     actions = {
+                        IconButton(onClick = { viewModel.toggleNightMode() }) {
+                            Icon(
+                                if (nightMode) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = "Night mode"
+                            )
+                        }
                         IconButton(onClick = { showLocationDialog = true }) {
                             Icon(Icons.Default.EditLocation, contentDescription = "Manual")
                         }
@@ -416,8 +581,8 @@ fun MainScreen(viewModel: AstroViewModel = viewModel()) {
             when (page) {
                 0 -> SunDetailsScreen(astroState, sunspots)
                 1 -> MoonDetailsScreen(astroState)
-                2 -> UnifiedCalendarScreen()
-                3 -> AuroraScreen()
+                2 -> UnifiedCalendarScreen(viewModel)
+                3 -> AuroraScreen(viewModel)
                 4 -> PolarisClockScreen(viewModel)
             }
         }
@@ -504,21 +669,57 @@ fun MoonDetailsScreen(state: AstroState) {
 }
 
 @Composable
-fun UnifiedCalendarScreen() {
+fun UnifiedCalendarScreen(viewModel: AstroViewModel) {
     var selectedTab by remember { mutableStateOf(0) }
-    val tabs = listOf("Rise/Set", "Twilight", "Moonrise", "Moon Phase")
+    val tabs = listOf("Sun", "Moon", "Phase", "Twilight")
+    val nightMode  = LocalNightMode.current
+    val year       by viewModel.calendarYear.collectAsState()
+    val month      by viewModel.calendarMonth.collectAsState()
+    val calData    by viewModel.calendarData.collectAsState()
+    val isLoading  by viewModel.calendarLoading.collectAsState()
+
+    val monthNames = listOf("January","February","March","April","May","June",
+                            "July","August","September","October","November","December")
+    val dayNames = listOf("Mo","Tu","We","Th","Fr","Sa","Su")
+
+    val tempCal = remember(year, month) { Calendar.getInstance().apply { set(year, month - 1, 1) } }
+    val daysInMonth    = tempCal.getActualMaximum(Calendar.DAY_OF_MONTH)
+    val firstDayOffset = (tempCal.get(Calendar.DAY_OF_WEEK) - 2 + 7) % 7   // Mon=0
+
     Column(modifier = Modifier.fillMaxSize()) {
-        ScrollableTabRow(selectedTabIndex = selectedTab) {
-            tabs.forEachIndexed { index, title -> Tab(selected = selectedTab == index, onClick = { selectedTab = index }, text = { Text(title) }) }
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = { viewModel.calendarPrevMonth() }) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Previous month")
+            }
+            Text("${monthNames[month - 1]} $year", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            IconButton(onClick = { viewModel.calendarNextMonth() }) {
+                Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Next month")
+            }
         }
-        LazyVerticalGrid(columns = GridCells.Fixed(7), modifier = Modifier.fillMaxSize().padding(8.dp)) {
-            items(31) { index ->
-                Card(modifier = Modifier.padding(2.dp).aspectRatio(0.8f)) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxSize().padding(4.dp)) {
-                        Text("${index + 1}", style = MaterialTheme.typography.labelSmall)
-                        Spacer(modifier = Modifier.weight(1f))
-                        Text("--:--", fontSize = 8.sp)
-                    }
+        ScrollableTabRow(selectedTabIndex = selectedTab) {
+            tabs.forEachIndexed { index, title ->
+                Tab(selected = selectedTab == index, onClick = { selectedTab = index }, text = { Text(title, fontSize = 11.sp) })
+            }
+        }
+        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)) {
+            dayNames.forEach { name ->
+                Text(name, modifier = Modifier.weight(1f), textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+            }
+        }
+        if (isLoading && calData.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        } else {
+            LazyVerticalGrid(columns = GridCells.Fixed(7), modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp)) {
+                items(firstDayOffset) { Box(modifier = Modifier.aspectRatio(0.65f)) }
+                items(daysInMonth) { dayIdx ->
+                    CalendarDayCell(day = dayIdx + 1, data = calData[dayIdx + 1], tab = selectedTab, nightMode = nightMode)
                 }
             }
         }
@@ -526,19 +727,117 @@ fun UnifiedCalendarScreen() {
 }
 
 @Composable
-fun AuroraScreen() {
-    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
-        SectionHeader("Kp Index")
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text("Current: 3.0", style = MaterialTheme.typography.headlineMedium)
-                Text("Low Activity", style = MaterialTheme.typography.bodyMedium)
+fun CalendarDayCell(day: Int, data: CalendarDayData?, tab: Int, nightMode: Boolean) {
+    val borderColor = if (nightMode) Color(0xFF550000) else MaterialTheme.colorScheme.outline
+    OutlinedCard(
+        modifier = Modifier.padding(1.dp).aspectRatio(0.65f),
+        colors = CardDefaults.outlinedCardColors(containerColor = Color.Transparent),
+        border = BorderStroke(0.5.dp, borderColor.copy(alpha = 0.5f))
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceEvenly,
+            modifier = Modifier.fillMaxSize().padding(horizontal = 0.dp, vertical = 2.dp)
+        ) {
+            Text(day.toString(), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            when (tab) {
+                0 -> { Text(data?.sunrise ?: "--:--", fontSize = 13.sp, lineHeight = 14.sp); Text(data?.sunset  ?: "--:--", fontSize = 13.sp, lineHeight = 14.sp) }
+                1 -> { Text(data?.moonrise ?: "--:--", fontSize = 13.sp, lineHeight = 14.sp); Text(data?.moonset  ?: "--:--", fontSize = 13.sp, lineHeight = 14.sp) }
+                2 -> { Text("${data?.moonIllumination ?: 0}%", fontSize = 15.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center) }
+                3 -> { Text(data?.civilDawn ?: "--:--", fontSize = 13.sp, lineHeight = 14.sp); Text(data?.civilDusk ?: "--:--", fontSize = 13.sp, lineHeight = 14.sp) }
             }
         }
-        Spacer(modifier = Modifier.height(16.dp))
-        Surface(modifier = Modifier.fillMaxWidth().height(200.dp), shape = MaterialTheme.shapes.medium, color = Color.DarkGray) {
-            Box(contentAlignment = Alignment.Center) { Text("Aurora Map Placeholder") }
+    }
+}
+
+@Composable
+fun AuroraScreen(viewModel: AstroViewModel) {
+    val kpIndex   by viewModel.kpIndex.collectAsState()
+    val nightMode  = LocalNightMode.current
+    val context    = LocalContext.current
+
+    fun kpLabel(kp: Float) = when {
+        kp < 3f -> "Quiet"
+        kp < 4f -> "Unsettled"
+        kp < 5f -> "Active"
+        kp < 6f -> "Minor Storm (G1)"
+        kp < 7f -> "Moderate Storm (G2)"
+        kp < 8f -> "Strong Storm (G3)"
+        kp < 9f -> "Severe Storm (G4)"
+        else    -> "Extreme Storm (G5)"
+    }
+    fun kpColor(kp: Float) = when {
+        kp < 3f -> if (nightMode) Color(0xFF882200) else Color(0xFF2E7D32)
+        kp < 5f -> if (nightMode) Color(0xFFBB6600) else Color(0xFFF57F17)
+        else    -> if (nightMode) Color(0xFFCC2200) else Color(0xFFC62828)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        // ── Kp Index ──────────────────────────────────────────────
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Kp Index", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = { viewModel.fetchKpIndex() }) {
+                Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+            }
         }
+        OutlinedCard(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.outlinedCardColors(containerColor = Color.Transparent)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                val kp = kpIndex
+                if (kp != null) {
+                    Text(
+                        "Current: ${"%.1f".format(kp)}",
+                        style = MaterialTheme.typography.headlineMedium
+                    )
+                    Text(
+                        kpLabel(kp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = kpColor(kp)
+                    )
+                } else {
+                    Text("Fetching Kp data…", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // ── Aurora Forecast ───────────────────────────────────────
+        Text(
+            "Aurora Forecast (NOAA)",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(Modifier.height(8.dp))
+        SubcomposeAsyncImage(
+            model = ImageRequest.Builder(context)
+                .data("https://services.swpc.noaa.gov/images/aurora-forecast-northern-hemisphere.jpg")
+                .crossfade(true)
+                .build(),
+            contentDescription = "NOAA Aurora forecast",
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f),
+            contentScale = ContentScale.Fit,
+            colorFilter = if (nightMode) ColorFilter.tint(Color(0xFFCC2200), BlendMode.Multiply) else null,
+            loading = {
+                Box(
+                    modifier = Modifier.fillMaxWidth().aspectRatio(1f),
+                    contentAlignment = Alignment.Center
+                ) { CircularProgressIndicator() }
+            }
+        )
     }
 }
 
@@ -568,6 +867,17 @@ fun decimalToDMS(decimal: Double, isLat: Boolean): String {
     val min = minFull.toInt()
     val sec = (minFull - min) * 60
     return "%d° %02d' %05.2f\" %s".format(deg, min, sec, dir)
+}
+
+/** Returns 0-100 moon illumination % for the given epoch millisecond. */
+fun moonIlluminationPct(epochMs: Long): Int {
+    // Reference new moon: Jan 29, 2025 ~12:35 UTC
+    val refNewMoonMs = 1738154100000L
+    val synodicMs    = 2_551_442_976.0   // 29.53059 days in ms
+    var age = (epochMs - refNewMoonMs) % synodicMs.toLong()
+    if (age < 0) age += synodicMs.toLong()
+    val illumination = (1 - Math.cos(age / synodicMs * 2 * Math.PI)) / 2 * 100
+    return illumination.roundToInt().coerceIn(0, 100)
 }
 
 @Composable
@@ -611,8 +921,7 @@ fun PolarisClockScreen(viewModel: AstroViewModel) {
         Text("LST  ${lstToHms(lstDeg)}", style = MaterialTheme.typography.titleMedium)
         Text(
             "HA  %02d:%02d:%02d".format(haH, haM, haS),
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.Gray
+            style = MaterialTheme.typography.bodyMedium
         )
         Text(
             text = "Polaris  %d:%02d:%02d".format(clockH, clockM, clockS),
@@ -620,6 +929,9 @@ fun PolarisClockScreen(viewModel: AstroViewModel) {
             fontWeight = FontWeight.Bold
         )
         Spacer(modifier = Modifier.height(8.dp))
+        val clockAccent  = MaterialTheme.colorScheme.primary       // NCP dot
+        val clockOutline = MaterialTheme.colorScheme.outline        // ring + ticks
+        val clockFg      = MaterialTheme.colorScheme.onBackground   // Polaris dot + line
         Canvas(modifier = Modifier.size(280.dp)) {
                 val radius = size.minDimension / 2.2f
                 for (h in 0 until 12) {
@@ -630,22 +942,21 @@ fun PolarisClockScreen(viewModel: AstroViewModel) {
                     val isMajor = h % 3 == 0
                     val tickInner = if (isMajor) radius * 0.82f else radius * 0.90f
                     drawLine(
-                        color = if (isMajor) Color.Gray else Color.DarkGray,
+                        color = if (isMajor) clockOutline else clockOutline.copy(alpha = 0.4f),
                         start = Offset(center.x + tickInner * cosA, center.y + tickInner * sinA),
                         end   = Offset(center.x + radius   * cosA, center.y + radius   * sinA),
                         strokeWidth = if (isMajor) 3f else 1.5f
                     )
                 }
-                drawCircle(Color.Gray, radius, center = center, style = Stroke(2f))
-                drawCircle(Color.Yellow, 4.dp.toPx(), center = center)
-                // Dot position: clockHours is a CW 12h clock value (1 = 1 o'clock, etc.)
-                val polAngDeg = 90.0 - clockHours * 30.0   // standard math angle, CW on screen
+                drawCircle(clockOutline, radius, center = center, style = Stroke(2f))
+                drawCircle(clockAccent, 4.dp.toPx(), center = center)
+                val polAngDeg = 90.0 - clockHours * 30.0
                 val polAngRad = Math.toRadians(polAngDeg)
                 val cosP =  cos(polAngRad).toFloat()
-                val sinP = -sin(polAngRad).toFloat()        // flip y for screen coords
+                val sinP = -sin(polAngRad).toFloat()
                 val polarisCenter = center + Offset(radius * cosP, radius * sinP)
-                drawLine(Color.White.copy(alpha = 0.3f), center, polarisCenter)
-                drawCircle(Color.White, 10.dp.toPx(), center = polarisCenter)
+                drawLine(clockFg.copy(alpha = 0.3f), center, polarisCenter)
+                drawCircle(clockFg, 10.dp.toPx(), center = polarisCenter)
         }
         Spacer(Modifier.height(20.dp))
         if (loc != null) {
@@ -656,11 +967,10 @@ fun PolarisClockScreen(viewModel: AstroViewModel) {
             Spacer(Modifier.height(4.dp))
             Text(
                 "${"%+.6f".format(loc.lat)}°,  ${"%+.6f".format(loc.lon)}°",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray
+                style = MaterialTheme.typography.bodySmall
             )
         } else {
-            Text("No location — tap GPS icon", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
+            Text("No location — tap GPS icon", style = MaterialTheme.typography.bodyMedium)
         }
     }
 }
@@ -668,6 +978,7 @@ fun PolarisClockScreen(viewModel: AstroViewModel) {
 @Composable
 fun SunDiskCanvas(sunspots: List<SunspotRegion>, modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val nightMode = LocalNightMode.current
     Box(
         modifier = modifier.clip(CircleShape),
         contentAlignment = Alignment.Center
@@ -680,14 +991,16 @@ fun SunDiskCanvas(sunspots: List<SunspotRegion>, modifier: Modifier = Modifier) 
             contentDescription = "Solar disk",
             modifier = Modifier.requiredSize(230.dp),
             contentScale = ContentScale.Crop,
+            colorFilter = if (nightMode) ColorFilter.tint(Color(0xFFCC2200), BlendMode.Multiply) else null,
             loading = {
                 Canvas(modifier = Modifier.requiredSize(230.dp)) {
                     val r = size.minDimension / 2f
                     drawCircle(
-                        brush = Brush.radialGradient(
-                            0f to Color(0xFFFFCC44),
-                            0.6f to Color(0xFFE8890C),
-                            1f to Color(0xFFA05000),
+                        brush = if (nightMode) Brush.radialGradient(
+                            0f to Color(0xFFCC2200), 0.6f to Color(0xFF880000), 1f to Color(0xFF330000),
+                            center = center, radius = r
+                        ) else Brush.radialGradient(
+                            0f to Color(0xFFFFCC44), 0.6f to Color(0xFFE8890C), 1f to Color(0xFFA05000),
                             center = center, radius = r
                         ),
                         radius = r
@@ -698,10 +1011,11 @@ fun SunDiskCanvas(sunspots: List<SunspotRegion>, modifier: Modifier = Modifier) 
                 Canvas(modifier = Modifier.requiredSize(230.dp)) {
                     val r = size.minDimension / 2f
                     drawCircle(
-                        brush = Brush.radialGradient(
-                            0f to Color(0xFFFFCC44),
-                            0.6f to Color(0xFFE8890C),
-                            1f to Color(0xFFA05000),
+                        brush = if (nightMode) Brush.radialGradient(
+                            0f to Color(0xFFCC2200), 0.6f to Color(0xFF880000), 1f to Color(0xFF330000),
+                            center = center, radius = r
+                        ) else Brush.radialGradient(
+                            0f to Color(0xFFFFCC44), 0.6f to Color(0xFFE8890C), 1f to Color(0xFFA05000),
                             center = center, radius = r
                         ),
                         radius = r
@@ -714,7 +1028,10 @@ fun SunDiskCanvas(sunspots: List<SunspotRegion>, modifier: Modifier = Modifier) 
                         val sy = (center.y - r * sin(phi)).toFloat()
                         val spotR = (r * 0.025f + r * 0.055f * (spot.area.coerceAtMost(500) / 500f))
                             .coerceIn(r * 0.02f, r * 0.10f)
-                        drawCircle(Color(0xFF3A1200).copy(alpha = 0.8f), spotR, Offset(sx, sy))
+                        drawCircle(
+                            if (nightMode) Color(0xFF220000).copy(alpha = 0.8f) else Color(0xFF3A1200).copy(alpha = 0.8f),
+                            spotR, Offset(sx, sy)
+                        )
                     }
                 }
             }
@@ -724,31 +1041,29 @@ fun SunDiskCanvas(sunspots: List<SunspotRegion>, modifier: Modifier = Modifier) 
 
 @Composable
 fun MoonPhaseCanvas(illuminationPct: Int, moonPhase: String, modifier: Modifier = Modifier) {
-    // Waxing = lit on right, waning = lit on left
     val isWaxing = moonPhase in setOf("Waxing Crescent", "First Quarter", "Waxing Gibbous", "New Moon")
+    val nightMode = LocalNightMode.current
+    val bgColor  = if (nightMode) Color.Black else Color(0xFF1A1A2E)
+    val litColor = if (nightMode) Color(0xFF990000) else Color(0xFFDDDDCC)
     Canvas(modifier = modifier) {
         val r = size.minDimension / 2f
         val cx = size.width / 2f
         val cy = size.height / 2f
-        // Dark background
-        drawCircle(Color(0xFF1A1A2E), r)
+        drawCircle(bgColor, r)
         val k = illuminationPct / 100f
-        if (k < 0.01f) return@Canvas  // New moon - fully dark
-        if (k > 0.99f) { drawCircle(Color(0xFFDDDDCC), r); return@Canvas }  // Full moon
-        // Terminator ellipse semi-minor axis
+        if (k < 0.01f) return@Canvas
+        if (k > 0.99f) { drawCircle(litColor, r); return@Canvas }
         val b = r * abs(1.0 - 2.0 * k).toFloat()
         val path = Path()
         val mainRect = Rect(cx - r, cy - r, cx + r, cy + r)
         val ellRect = Rect(cx - b, cy - r, cx + b, cy + r)
-        // sweep1: which semicircle is lit (right=CW=+180 for waxing, left=CCW=-180 for waning)
         val sweep1 = if (isWaxing) 180f else -180f
-        // sweep2: terminator direction (determines crescent vs gibbous)
         val crescent = k <= 0.5f
         val sweep2 = if (isWaxing == crescent) -180f else 180f
         path.arcTo(mainRect, -90f, sweep1, forceMoveTo = true)
         path.arcTo(ellRect, 90f, sweep2, forceMoveTo = false)
         path.close()
-        drawPath(path, Color(0xFFDDDDCC))
+        drawPath(path, litColor)
     }
 }
 
