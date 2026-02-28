@@ -130,11 +130,23 @@ data class CalendarDayData(
     val moonset:          String = "--:--",
     val moonIllumination: Int    = 0
 )
+data class LocationResult(
+    val displayName: String,
+    val shortName:   String,
+    val lat: Double,
+    val lon: Double
+)
 // --- ViewModel ---
 class AstroViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("astro_prefs", Context.MODE_PRIVATE)
 
-    private val _location = MutableStateFlow<AppLocation?>(AppLocation(50.0755, 14.4378, "Prague, CZ"))
+    private val _location = MutableStateFlow<AppLocation?>(
+        prefs.getString("location_name", null)?.let { name ->
+            val lat = prefs.getString("location_lat", null)?.toDoubleOrNull()
+            val lon = prefs.getString("location_lon", null)?.toDoubleOrNull()
+            if (lat != null && lon != null) AppLocation(lat, lon, name) else null
+        } ?: AppLocation(50.0755, 14.4378, "Prague, CZ")
+    )
     val location = _location.asStateFlow()
 
     private val _astroState = MutableStateFlow(AstroState())
@@ -149,6 +161,9 @@ class AstroViewModel(application: Application) : AndroidViewModel(application) {
     private val _kpIndex = MutableStateFlow<Float?>(null)
     val kpIndex = _kpIndex.asStateFlow()
 
+    private val _locationSearchResults = MutableStateFlow<List<LocationResult>>(emptyList())
+    val locationSearchResults = _locationSearchResults.asStateFlow()
+
     private val _calendarYear    = MutableStateFlow(Calendar.getInstance().get(Calendar.YEAR))
     private val _calendarMonth   = MutableStateFlow(Calendar.getInstance().get(Calendar.MONTH) + 1)
     val calendarYear  = _calendarYear.asStateFlow()
@@ -161,6 +176,9 @@ class AstroViewModel(application: Application) : AndroidViewModel(application) {
 
     private var astroJob: Job? = null
 
+    // Persists the current pager page across recompositions (e.g. night mode toggle)
+    var lastPage: Int = 0
+
     init {
         calculateAstroData()
         fetchSunspots()
@@ -168,11 +186,34 @@ class AstroViewModel(application: Application) : AndroidViewModel(application) {
         fetchKpIndex()
     }
 
+    /** Called when the user sets a location manually (search/dialog). Persists it and prevents GPS override on next startup. */
     fun updateLocation(lat: Double, lon: Double, name: String) {
         _location.value = AppLocation(lat, lon, name)
+        prefs.edit()
+            .putString("location_lat", lat.toString())
+            .putString("location_lon", lon.toString())
+            .putString("location_name", name)
+            .putBoolean("location_is_manual", true)
+            .apply()
         calculateAstroData()
         computeCalendar()
     }
+
+    /** Called when the GPS button is explicitly tapped. Saves GPS location and clears the manual flag so future startups can auto-GPS again. */
+    fun updateLocationFromGps(lat: Double, lon: Double, name: String) {
+        _location.value = AppLocation(lat, lon, name)
+        prefs.edit()
+            .putString("location_lat", lat.toString())
+            .putString("location_lon", lon.toString())
+            .putString("location_name", name)
+            .putBoolean("location_is_manual", false)
+            .apply()
+        calculateAstroData()
+        computeCalendar()
+    }
+
+    /** Returns true if the user has manually set a location that should not be overridden by auto-GPS on startup. */
+    fun isLocationManuallySet(): Boolean = prefs.getBoolean("location_is_manual", false)
 
     fun calculateAstroData(date: LocalDate = Calendar.getInstance().let { cal ->
         LocalDate(cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH))
@@ -376,6 +417,34 @@ class AstroViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun searchLocation(query: String) {
+        if (query.isBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val encoded = java.net.URLEncoder.encode(query, "UTF-8")
+                val conn = java.net.URL(
+                    "https://nominatim.openstreetmap.org/search?q=$encoded&format=json&limit=5"
+                ).openConnection() as java.net.HttpURLConnection
+                conn.setRequestProperty("User-Agent", "AstrophotoApp/1.0")
+                val json = JSONArray(conn.inputStream.bufferedReader().readText())
+                _locationSearchResults.value = (0 until json.length()).map { i ->
+                    val obj = json.getJSONObject(i)
+                    val display = obj.getString("display_name")
+                    LocationResult(
+                        displayName = display,
+                        shortName   = display.split(",").take(2).joinToString(",").trim(),
+                        lat = obj.getString("lat").toDouble(),
+                        lon = obj.getString("lon").toDouble()
+                    )
+                }
+            } catch (_: Exception) { }
+        }
+    }
+
+    fun clearLocationSearch() {
+        _locationSearchResults.value = emptyList()
+    }
+
     fun toggleNightMode() {
         val new = !_nightMode.value
         _nightMode.value = new
@@ -454,9 +523,9 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun MainScreen(viewModel: AstroViewModel = viewModel()) {
-    val pagerState = rememberPagerState(pageCount = { 5 })
+    val pagerState = rememberPagerState(initialPage = viewModel.lastPage, pageCount = { 5 })
+    LaunchedEffect(pagerState.currentPage) { viewModel.lastPage = pagerState.currentPage }
     val scope = rememberCoroutineScope()
-    var showMenu by remember { mutableStateOf(false) }
     var showLocationDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val locationState by viewModel.location.collectAsState()
@@ -482,22 +551,67 @@ fun MainScreen(viewModel: AstroViewModel = viewModel()) {
     }
 
     LaunchedEffect(Unit) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-            fetchLocation(context, viewModel)
-        } else {
-            permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+        if (!viewModel.isLocationManuallySet()) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                fetchLocation(context, viewModel)
+            } else {
+                permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+            }
         }
     }
 
     if (showLocationDialog) {
-        var latText by remember { mutableStateOf(locationState?.lat?.toString() ?: "") }
-        var lonText by remember { mutableStateOf(locationState?.lon?.toString() ?: "") }
+        var searchQuery by remember { mutableStateOf("") }
+        var latText  by remember { mutableStateOf(locationState?.lat?.toString() ?: "") }
+        var lonText  by remember { mutableStateOf(locationState?.lon?.toString() ?: "") }
         var nameText by remember { mutableStateOf(locationState?.name ?: "") }
+        val searchResults by viewModel.locationSearchResults.collectAsState()
         AlertDialog(
-            onDismissRequest = { showLocationDialog = false },
+            onDismissRequest = { showLocationDialog = false; viewModel.clearLocationSearch() },
             title = { Text("Set Location") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // ── Search bar ──────────────────────────────────
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            label = { Text("Search by name") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = { viewModel.searchLocation(searchQuery) }) {
+                            Icon(Icons.Filled.Search, contentDescription = "Search")
+                        }
+                    }
+                    // ── Search results ──────────────────────────────
+                    if (searchResults.isNotEmpty()) {
+                        searchResults.forEach { result ->
+                            TextButton(
+                                onClick = {
+                                    nameText  = result.shortName
+                                    latText   = "%.6f".format(java.util.Locale.US, result.lat)
+                                    lonText   = "%.6f".format(java.util.Locale.US, result.lon)
+                                    searchQuery = ""
+                                    viewModel.clearLocationSearch()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    result.displayName,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    textAlign = TextAlign.Start,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                            HorizontalDivider()
+                        }
+                    }
+                    // ── Manual / auto-filled fields ─────────────────
                     OutlinedTextField(
                         value = nameText, onValueChange = { nameText = it },
                         label = { Text("Name") }, singleLine = true,
@@ -517,16 +631,17 @@ fun MainScreen(viewModel: AstroViewModel = viewModel()) {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    val lat = latText.toDoubleOrNull()
-                    val lon = lonText.toDoubleOrNull()
+                    val lat = latText.trim().replace(',', '.').toDoubleOrNull()
+                    val lon = lonText.trim().replace(',', '.').toDoubleOrNull()
                     if (lat != null && lon != null) {
                         viewModel.updateLocation(lat, lon, nameText.ifBlank { "Custom" })
                         showLocationDialog = false
+                        viewModel.clearLocationSearch()
                     }
                 }) { Text("OK") }
             },
             dismissButton = {
-                TextButton(onClick = { showLocationDialog = false }) { Text("Cancel") }
+                TextButton(onClick = { showLocationDialog = false; viewModel.clearLocationSearch() }) { Text("Cancel") }
             }
         )
     }
@@ -550,14 +665,6 @@ fun MainScreen(viewModel: AstroViewModel = viewModel()) {
                         }
                         IconButton(onClick = { fetchLocation(context, viewModel) }) {
                             Icon(Icons.Default.MyLocation, contentDescription = "GPS")
-                        }
-                        IconButton(onClick = { showMenu = true }) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "Menu")
-                        }
-                        DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                            listOf("Configuration", "Location", "Change Date", "Share", "Contact Us").forEach {
-                                DropdownMenuItem(text = { Text(it) }, onClick = { showMenu = false })
-                            }
                         }
                     }
                 )
@@ -596,7 +703,7 @@ private fun fetchLocation(context: Context, viewModel: AstroViewModel) {
     fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
         .addOnSuccessListener { location ->
             location?.let {
-                viewModel.updateLocation(it.latitude, it.longitude, "Device Location")
+                viewModel.updateLocationFromGps(it.latitude, it.longitude, "Device Location")
             }
         }
 }
@@ -1000,7 +1107,7 @@ fun SunDiskCanvas(sunspots: List<SunspotRegion>, modifier: Modifier = Modifier) 
                             0f to Color(0xFFCC2200), 0.6f to Color(0xFF880000), 1f to Color(0xFF330000),
                             center = center, radius = r
                         ) else Brush.radialGradient(
-                            0f to Color(0xFFFFCC44), 0.6f to Color(0xFFE8890C), 1f to Color(0xFFA05000),
+                            0f to Color(0xFF848484), 0.6f to Color(0xFF686868), 1f to Color(0xFF4A4A4A),
                             center = center, radius = r
                         ),
                         radius = r
@@ -1015,7 +1122,7 @@ fun SunDiskCanvas(sunspots: List<SunspotRegion>, modifier: Modifier = Modifier) 
                             0f to Color(0xFFCC2200), 0.6f to Color(0xFF880000), 1f to Color(0xFF330000),
                             center = center, radius = r
                         ) else Brush.radialGradient(
-                            0f to Color(0xFFFFCC44), 0.6f to Color(0xFFE8890C), 1f to Color(0xFFA05000),
+                            0f to Color(0xFF848484), 0.6f to Color(0xFF686868), 1f to Color(0xFF4A4A4A),
                             center = center, radius = r
                         ),
                         radius = r
